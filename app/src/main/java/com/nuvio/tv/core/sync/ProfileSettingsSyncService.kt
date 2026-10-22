@@ -16,7 +16,9 @@ import com.nuvio.tv.core.auth.AuthManager
 import com.nuvio.tv.core.profile.ProfileManager
 import com.nuvio.tv.data.local.ContinueWatchingEnrichmentCache
 import com.nuvio.tv.data.local.ExperienceModeDataStore
+import com.nuvio.tv.data.local.PluginDataStore
 import com.nuvio.tv.data.local.ProfileDataStoreFactory
+import com.nuvio.tv.data.local.ProfileLockSettingsDataStore
 import com.nuvio.tv.data.local.StreamBadgeSettingsDataStore
 import com.nuvio.tv.data.local.TmdbSettingsDataStore
 import com.nuvio.tv.data.remote.supabase.SupabaseProfileSetupCopyResult
@@ -99,6 +101,7 @@ private val localOnlyPlayerProfileSettingsKeys = setOf(
     "map_dv7_to_hevc",
     "dv7_libdovi_mode_override",
     "strip_hdr10plus_sei",
+    "exo_chapters_enabled",
     "mpv_hardware_decode_mode",
     "frame_rate_matching",
     "frame_rate_matching_mode",
@@ -143,6 +146,11 @@ private val localOnlyPlayerProfileSettingsKeys = setOf(
     "nuvio_performance_mode_enabled"
 )
 
+// 4K trailers depend on the device's RAM, so a choice made on one device must not reach another.
+private val localOnlyTrailerProfileSettingsKeys = setOf(
+    "trailer_allow_4k"
+)
+
 private val credentialProfileSettingsKeys = mapOf(
     "debrid_settings" to setOf(
         "torbox_api_key",
@@ -159,6 +167,8 @@ internal fun shouldExcludePreferenceFromProfileSettingsSync(feature: String, key
         feature == "layout_settings" && keyName in localOnlyLayoutProfileSettingsKeys -> true
         feature == "layout_settings" && keyName == "search_discover_enabled" -> true
         feature == PLAYER_SETTINGS_FEATURE && keyName in localOnlyPlayerProfileSettingsKeys -> true
+        feature == "trailer_settings" && keyName in localOnlyTrailerProfileSettingsKeys -> true
+        feature == PluginDataStore.FEATURE && keyName != PluginDataStore.GROUP_STREAMS_BY_REPOSITORY -> true
         keyName in credentialProfileSettingsKeys[feature].orEmpty() -> true
         else -> false
     }
@@ -172,6 +182,7 @@ class ProfileSettingsSyncService @Inject constructor(
     private val profileDataStoreFactory: ProfileDataStoreFactory,
     private val syncClientIdentity: SyncClientIdentity,
     private val providerCredentialSyncService: ProviderCredentialSyncService,
+    private val mediaServerSyncService: MediaServerSyncService,
     private val tmdbSettingsDataStore: TmdbSettingsDataStore,
     private val metaRepository: MetaRepository,
     private val cwEnrichmentCache: ContinueWatchingEnrichmentCache
@@ -193,13 +204,15 @@ class ProfileSettingsSyncService @Inject constructor(
         ExperienceModeDataStore.FEATURE,
         PLAYER_SETTINGS_FEATURE,
         StreamBadgeSettingsDataStore.FEATURE,
+        PluginDataStore.FEATURE,
         "trailer_settings",
         "tmdb_settings",
         "mdblist_settings",
         "trakt_settings",
         "debrid_settings",
         "animeskip_settings",
-        "track_preference"
+        "track_preference",
+        ProfileLockSettingsDataStore.FEATURE
     )
 
     init {
@@ -215,10 +228,12 @@ class ProfileSettingsSyncService @Inject constructor(
         }
     }
 
-    suspend fun pushCurrentProfileToRemote(): Result<Unit> = withContext(Dispatchers.IO) {
+    suspend fun pushCurrentProfileToRemote(): Result<Unit> =
+        pushProfileSettingsToRemote(profileManager.activeProfileId.value)
+
+    private suspend fun pushProfileSettingsToRemote(profileId: Int): Result<Unit> = withContext(Dispatchers.IO) {
         syncMutex.withLock {
             try {
-                val profileId = profileManager.activeProfileId.value
                 pushProfileToRemote(profileId)
                 Log.d(TAG, "Pushed profile settings blob for profile $profileId")
                 Result.success(Unit)
@@ -229,23 +244,65 @@ class ProfileSettingsSyncService @Inject constructor(
         }
     }
 
+    /**
+     * Applies [change] to the settings of [profileId]. The active profile's changes are uploaded by the
+     * observer below. Another profile is refreshed from the cloud first, because this device's copy of it
+     * can be old and an upload replaces the profile's whole settings.
+     */
+    suspend fun updateProfileSettings(profileId: Int, change: suspend () -> Unit) = withContext(Dispatchers.IO) {
+        if (profileId == profileManager.activeProfileId.value || !authManager.isAuthenticated) {
+            change()
+            return@withContext
+        }
+        syncMutex.withLock {
+            val remote = try {
+                Result.success(pullProfileFromRemote(profileId))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to pull profile settings blob for profile $profileId", e)
+                Result.failure(e)
+            }
+            remote.getOrNull()?.get("features")?.jsonObject?.let { featuresJson ->
+                val remoteSignature = buildSettingsSignature(featuresJson)
+                if (remoteSignature != buildSettingsSignature(profileId)) {
+                    applySettingsBlob(profileId, featuresJson, remoteSignature)
+                }
+            }
+            change()
+            // Without the cloud copy, uploading could overwrite newer settings; keep the change on this device.
+            if (remote.isSuccess) {
+                try {
+                    pushProfileToRemote(profileId)
+                    Log.d(TAG, "Pushed profile settings blob for profile $profileId")
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to push profile settings blob for profile $profileId", e)
+                }
+            }
+        }
+    }
+
     suspend fun pullCurrentProfileFromRemote(): Result<Boolean> = withContext(Dispatchers.IO) {
         syncMutex.withLock {
             try {
                 val profileId = profileManager.activeProfileId.value
+                val inheritedPluginSettingsApplied = pullInheritedPluginSettings(profileId)
                 val blob = pullProfileFromRemote(profileId)
                 lastForegroundPullAtMs = SystemClock.elapsedRealtime()
                 if (blob == null) {
                     Log.d(TAG, "No remote profile settings blob for profile $profileId; keeping local settings")
-                    return@withLock Result.success(false)
+                    return@withLock Result.success(inheritedPluginSettingsApplied)
                 }
 
-                val featuresJson = blob["features"]?.jsonObject ?: return@withLock Result.success(false)
+                val featuresJson = blob["features"]?.jsonObject
+                    ?: return@withLock Result.success(inheritedPluginSettingsApplied)
                 val remoteSignature = buildSettingsSignature(featuresJson)
                 val localSignature = buildSettingsSignature(profileId)
                 if (remoteSignature == localSignature) {
                     Log.d(TAG, "Remote profile settings already match local for profile $profileId")
-                    return@withLock Result.success(false)
+                    return@withLock Result.success(inheritedPluginSettingsApplied)
                 }
 
                 applySettingsBlob(profileId, featuresJson, remoteSignature)
@@ -354,6 +411,7 @@ class ProfileSettingsSyncService @Inject constructor(
 
     fun requestForegroundPull(force: Boolean = false) {
         providerCredentialSyncService.requestForegroundPull(force)
+        mediaServerSyncService.requestForegroundPull(force)
         if (!authManager.isAuthenticated) return
 
         val now = SystemClock.elapsedRealtime()
@@ -410,6 +468,29 @@ class ProfileSettingsSyncService @Inject constructor(
         }
     }
 
+    private suspend fun pullInheritedPluginSettings(profileId: Int): Boolean {
+        val profile = profileManager.profiles.value.firstOrNull { it.id == profileId }
+        if (profileId == 1 || profile?.usesPrimaryPlugins != true) return false
+        val features = pullProfileFromRemote(1)?.get("features") as? JsonObject ?: return false
+        val pluginSettings = features[PluginDataStore.FEATURE] as? JsonObject ?: return false
+        return importPluginSettings(1, pluginSettings)
+    }
+
+    private suspend fun importPluginSettings(profileId: Int, featureJson: JsonObject): Boolean {
+        val keyName = PluginDataStore.GROUP_STREAMS_BY_REPOSITORY
+        val encoded = featureJson[keyName] as? JsonObject ?: return false
+        if ((encoded["type"] as? JsonPrimitive)?.contentOrNull != "boolean") return false
+        val enabled = (encoded["value"] as? JsonPrimitive)?.contentOrNull?.toBooleanStrictOrNull()
+            ?: return false
+        var changed = false
+        profileDataStoreFactory.get(profileId, PluginDataStore.FEATURE).edit { prefs ->
+            val key = booleanPreferencesKey(keyName)
+            changed = prefs[key] != enabled
+            prefs[key] = enabled
+        }
+        return changed
+    }
+
     private suspend fun copyProviderCredentialsLocally(sourceProfileId: Int, targetProfileId: Int) {
         credentialProfileSettingsKeys.forEach { (feature, keyNames) ->
             val sourcePreferences = profileDataStoreFactory.get(sourceProfileId, feature).data.first()
@@ -452,6 +533,10 @@ class ProfileSettingsSyncService @Inject constructor(
         try {
             syncedFeatures.forEach { feature ->
                 val featureJson = featuresJson[feature]?.jsonObject ?: return@forEach
+                if (feature == PluginDataStore.FEATURE) {
+                    importPluginSettings(profileId, featureJson)
+                    return@forEach
+                }
                 profileDataStoreFactory.get(profileId, feature).edit { mutablePrefs ->
                     val preservedEntries = captureLocalOnlyPreferenceEntries(feature, mutablePrefs)
                     val priorDiscoverLocation = if (feature == "layout_settings") {
@@ -530,13 +615,16 @@ class ProfileSettingsSyncService @Inject constructor(
                             }
                     }
                     combine(featureFlows) { signatures ->
-                        signatures.joinToString(separator = "||")
+                        profileId to signatures.joinToString(separator = "||")
                     }
+                        .distinctUntilChanged()
+                        // The first value is the profile's stored state, not a local edit. On a
+                        // profile switch it can be older than the cloud copy that is about to be
+                        // pulled, so pushing it would overwrite newer settings.
+                        .drop(1)
                 }
-                .drop(1)
-                .distinctUntilChanged()
                 .debounce(SETTINGS_PUSH_DEBOUNCE_MS)
-                .collect { signature ->
+                .collect { (profileId, signature) ->
                     if (!authManager.isAuthenticated) return@collect
                     if (applyingRemoteBlob) return@collect
                     if (profileDataStoreFactory.corruptedFileNames.isNotEmpty()) {
@@ -549,7 +637,8 @@ class ProfileSettingsSyncService @Inject constructor(
                         skipNextPushSignature = null
                         return@collect
                     }
-                    pushCurrentProfileToRemote()
+                    // A change debounced across a profile switch still belongs to the profile it was made on.
+                    pushProfileSettingsToRemote(profileId)
                 }
         }
     }
@@ -645,6 +734,7 @@ class ProfileSettingsSyncService @Inject constructor(
         val keyNames = when (feature) {
             "layout_settings" -> catalogKeysExcludedFromProfileSettingsBlob + localOnlyLayoutProfileSettingsKeys
             PLAYER_SETTINGS_FEATURE -> localOnlyPlayerProfileSettingsKeys
+            "trailer_settings" -> localOnlyTrailerProfileSettingsKeys
             else -> credentialProfileSettingsKeys[feature].orEmpty()
         }
         if (keyNames.isEmpty()) return emptyMap()

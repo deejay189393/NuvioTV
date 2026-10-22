@@ -5,6 +5,7 @@ import com.nuvio.tv.ui.theme.NuvioTheme
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.defaultMinSize
@@ -74,12 +75,14 @@ import com.nuvio.tv.domain.model.FolderViewMode
 import com.nuvio.tv.domain.model.HomeLayout
 import com.nuvio.tv.ui.components.CatalogRowSection
 import com.nuvio.tv.ui.components.ContentCard
+import com.nuvio.tv.ui.components.GridContentCard
 import com.nuvio.tv.ui.components.LoadingIndicator
 import com.nuvio.tv.R
 import androidx.compose.ui.res.stringResource
 import com.nuvio.tv.ui.components.PosterCardDefaults
 import com.nuvio.tv.ui.components.PosterCardStyle
 import com.nuvio.tv.ui.components.LocalCardDepthStyle
+import com.nuvio.tv.ui.components.LocalLandscapePosterMode
 import com.nuvio.tv.ui.components.nuvioCardDepth
 import com.nuvio.tv.domain.model.CardDepthSurface
 import com.nuvio.tv.ui.screens.home.ClassicFocusArtwork
@@ -146,8 +149,8 @@ fun FolderDetailScreen(
             onLoadMoreCatalog = viewModel::loadMoreForCatalog,
             onSelectTab = viewModel::selectTab,
             onLoadMoreForSelectedTab = { viewModel.loadMoreItems(viewModel.uiState.value.selectedTabIndex) },
-            onSaveFocusState = { vi, vo, rk, ikm, m, ri, ii ->
-                viewModel.saveFollowLayoutFocusState(vi, vo, rk, ikm, m, ri, ii)
+            onSaveFocusState = { vi, vo, rk, ikm, m, ma, ri, ii ->
+                viewModel.saveFollowLayoutFocusState(vi, vo, rk, ikm, m, ma, ri, ii)
             },
             onItemFocus = viewModel::onItemFocused,
             onPreloadAdjacentItem = viewModel::preloadAdjacentItem,
@@ -157,6 +160,7 @@ fun FolderDetailScreen(
             trailerPreviewUrls = trailerPreviewUrls,
             trailerPreviewAudioUrls = trailerPreviewAudioUrls,
             onRequestTrailerPreview = viewModel::requestTrailerPreview,
+            onFocusedRowKeyChanged = viewModel::onFocusedRowChanged,
             scrollToTopTrigger = scrollToTopTrigger
         )
     } else {
@@ -194,8 +198,8 @@ fun FolderDetailScreen(
                         onNavigateToDetail = onNavigateToDetail,
                         isItemWatched = isItemWatched,
                         onLoadMoreCatalog = viewModel::loadMoreForCatalog,
-                        onSaveFocusState = { vi, vo, rk, ikm, m, ri, ii ->
-                            viewModel.saveRowsFocusState(vi, vo, rk, ikm, m, ri, ii)
+                        onSaveFocusState = { vi, vo, rk, ikm, m, ma, ri, ii ->
+                            viewModel.saveRowsFocusState(vi, vo, rk, ikm, m, ma, ri, ii)
                         },
                         onItemFocus = viewModel::onItemFocused,
                         onItemLongPress = { item, addonBaseUrl ->
@@ -392,7 +396,9 @@ private fun TabbedGridContent(
         }
         currentTab.catalogRow != null -> {
             val items = currentTab.catalogRow.items
-            val posterCardStyle = PosterCardDefaults.Style.copy(
+            val posterCardStyle = PosterCardStyle(
+                width = uiState.posterCardWidthDp.dp,
+                height = (uiState.posterCardWidthDp * 1.5f).dp,
                 cornerRadius = uiState.posterCardCornerRadiusDp.dp
             )
             val itemFocusRequesters = remember(uiState.selectedTabIndex) { mutableMapOf<String, FocusRequester>() }
@@ -464,9 +470,10 @@ private fun TabbedGridContent(
                     }
             }
 
+            val globalLandscape = LocalLandscapePosterMode.current
             LazyVerticalGrid(
                 state = gridState,
-                columns = GridCells.Adaptive(minSize = posterCardStyle.width),
+                columns = GridCells.Adaptive(minSize = if (globalLandscape) posterCardStyle.height else posterCardStyle.width),
                 modifier = Modifier
                     .fillMaxSize()
                     .onFocusChanged { gridHasFocus = it.hasFocus }
@@ -489,12 +496,13 @@ private fun TabbedGridContent(
                 ) { index, item ->
                     val itemKey = "${item.id}_$index"
                     val focusReq = itemFocusRequesters.getOrPut(itemKey) { FocusRequester() }
-                    ContentCard(
+                    GridContentCard(
                         item = item,
                         posterCardStyle = posterCardStyle,
                         focusRequester = focusReq,
                         isWatched = isItemWatched(item),
-                        onFocus = { _ -> lastFocusedItemKey = itemKey },
+                        showReleaseInfo = true,
+                        onFocused = { lastFocusedItemKey = itemKey },
                         onClick = {
                             HeroBackdropState.update(item.backdropUrl)
                             onNavigateToDetail(
@@ -515,14 +523,20 @@ private fun TabbedGridContent(
                     ) {
                         val cardShape = RoundedCornerShape(posterCardStyle.cornerRadius)
                         val cardDepthStyle = LocalCardDepthStyle.current
+                        val globalLandscape = LocalLandscapePosterMode.current
+                        val loadingCardHeight = if (globalLandscape) {
+                            posterCardStyle.width / com.nuvio.tv.domain.model.PosterShape.LANDSCAPE.aspectRatio()
+                        } else {
+                            posterCardStyle.width * 1.5f
+                        }
                         Column(
                             modifier = Modifier.width(posterCardStyle.width)
                         ) {
                             Card(
                                 onClick = {},
                                 modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(posterCardStyle.height)
+                                    .width(posterCardStyle.width)
+                                    .height(loadingCardHeight)
                                     .focusProperties { canFocus = false },
                                 shape = CardDefaults.shape(shape = cardShape),
                                 colors = CardDefaults.colors(
@@ -569,7 +583,7 @@ private fun RowsContent(
     focusState: HomeScreenFocusState,
     onNavigateToDetail: (String, String, String) -> Unit,
     onLoadMoreCatalog: (String, String, String) -> Unit = { _, _, _ -> },
-    onSaveFocusState: (Int, Int, String?, Map<String, String>, Map<String, Int>, Int, Int) -> Unit,
+    onSaveFocusState: (Int, Int, String?, Map<String, String>, Map<String, Int>, Map<String, String>, Int, Int) -> Unit,
     isItemWatched: (MetaPreview) -> Boolean = { false },
     onItemFocus: (MetaPreview) -> Unit = {},
     onItemLongPress: (MetaPreview, String) -> Unit = { _, _ -> },
@@ -646,6 +660,7 @@ private fun RowsContent(
                 focusedRowKey,
                 itemKeys,
                 rowStates.mapValues { it.value.firstVisibleItemIndex },
+                emptyMap(), // rows here are restored by index
                 -1, // rowIndex
                 rowFocusedItemIndex[focusedRowKey] ?: 0 // itemIndex — positional fallback
             )
@@ -766,6 +781,12 @@ private fun RowsContent(
                         tab.label
                     }
                 }
+                val globalLandscape = LocalLandscapePosterMode.current
+                val containerHeight = if (globalLandscape) {
+                    posterCardStyle.width / com.nuvio.tv.domain.model.PosterShape.LANDSCAPE.aspectRatio()
+                } else {
+                    posterCardStyle.height
+                }
                 when {
                     tab.isLoading -> {
                         Column(modifier = Modifier.fillMaxWidth()) {
@@ -778,7 +799,7 @@ private fun RowsContent(
                             Box(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .height(posterCardStyle.height),
+                                    .height(containerHeight),
                                 contentAlignment = Alignment.Center
                             ) {
                                 LoadingIndicator()
@@ -796,7 +817,7 @@ private fun RowsContent(
                             Box(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .height(posterCardStyle.height),
+                                    .height(containerHeight),
                                 contentAlignment = Alignment.Center
                             ) {
                                 Text(text = tab.error, color = NuvioTheme.colors.TextSecondary)
@@ -870,13 +891,14 @@ private fun FollowLayoutContent(
     onLoadMoreCatalog: (String, String, String) -> Unit = { _, _, _ -> },
     onSelectTab: (Int) -> Unit = {},
     onLoadMoreForSelectedTab: () -> Unit = {},
-    onSaveFocusState: (Int, Int, String?, Map<String, String>, Map<String, Int>, Int, Int) -> Unit,
+    onSaveFocusState: (Int, Int, String?, Map<String, String>, Map<String, Int>, Map<String, String>, Int, Int) -> Unit,
     onItemFocus: (MetaPreview) -> Unit = {},
     onPreloadAdjacentItem: (MetaPreview) -> Unit = {},
     onCatalogItemLongPress: (MetaPreview, String) -> Unit = { _, _ -> },
     trailerPreviewUrls: Map<String, String> = emptyMap(),
     trailerPreviewAudioUrls: Map<String, String> = emptyMap(),
     onRequestTrailerPreview: (String, String, String?, String) -> Unit = { _, _, _, _ -> },
+    onFocusedRowKeyChanged: (String?) -> Unit = {},
     scrollToTopTrigger: Int = 0
 ) {
     val homeState = uiState.followLayoutHomeState
@@ -991,6 +1013,7 @@ private fun FollowLayoutContent(
             onItemFocus = onItemFocus,
             onPreloadAdjacentItem = onPreloadAdjacentItem,
             onSaveFocusState = onSaveFocusState,
+            onFocusedRowKeyChanged = onFocusedRowKeyChanged,
             scrollToTopTrigger = scrollToTopTrigger,
             blockLeftOnFirstExpandedItem = true
         )

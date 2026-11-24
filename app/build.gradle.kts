@@ -521,6 +521,9 @@ dependencies {
     implementation(libs.okhttp.logging)
     implementation(libs.moshi)
     ksp(libs.moshi.codegen)
+    // kotlin-reflect comes in transitively (Moshi, Jackson, Postgrest) at an older version. Keep it on the
+    // Kotlin version: since 2.3 it builds typeOf() results from class metadata instead of compiler descriptors.
+    implementation(libs.kotlin.reflect)
 
     // Coroutines
     implementation(libs.coroutines.core)

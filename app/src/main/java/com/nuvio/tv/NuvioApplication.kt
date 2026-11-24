@@ -62,6 +62,15 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
     @Inject lateinit var siloArtworkRefresher: SiloArtworkRefresher
 
     companion object {
+        init {
+            // With kotlin-reflect on the classpath, every typeOf() goes through it. Ktor calls typeOf() while
+            // building the Supabase client, which happens on the main thread's path to the first frame, and
+            // by default kotlin-reflect answers it by loading compiler descriptors for the class and the whole
+            // builtins package. Reading the class metadata directly skips that. Set here, in the static
+            // initializer, so it is in place before anything touches kotlin-reflect.
+            System.setProperty("kotlin.reflect.jvm.loadMetadataDirectly", "true")
+        }
+
         /**
          * Shared cookie jar for CloudStream extension HTTP requests.
          * Accessible so the player's OkHttpClient can share cookies

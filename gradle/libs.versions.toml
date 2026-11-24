@@ -2,6 +2,7 @@
 agp = "8.13.2"
 cryptoJs = "4.2.0"
 kotlin = "2.3.0"
+kotlinReflect = "2.4.21"
 coreKtx = "1.15.0"
 appcompat = "1.6.1"
 composeBom = "2026.05.01"
@@ -77,6 +78,8 @@ okhttp-logging = { group = "com.squareup.okhttp3", name = "logging-interceptor",
 re2j = { group = "com.google.re2j", name = "re2j", version.ref = "re2j" }
 moshi = { group = "com.squareup.moshi", name = "moshi-kotlin", version.ref = "moshi" }
 moshi-codegen = { group = "com.squareup.moshi", name = "moshi-kotlin-codegen", version.ref = "moshi" }
+kotlin-reflect = { group = "org.jetbrains.kotlin", name = "kotlin-reflect", version.ref = "kotlinReflect" }
+kotlin-metadata-jvm = { group = "org.jetbrains.kotlin", name = "kotlin-metadata-jvm", version.ref = "kotlinReflect" }
 
 # Coroutines
 coroutines-core = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-core", version.ref = "coroutines" }

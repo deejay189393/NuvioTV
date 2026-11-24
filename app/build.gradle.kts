@@ -510,6 +510,9 @@ dependencies {
     // Hilt
     implementation(libs.hilt.android)
     ksp(libs.hilt.compiler)
+    // kotlin-reflect 2.4 (below) brings kotlin-stdlib 2.4, whose class metadata Hilt 2.58 reads with a
+    // kotlin-metadata-jvm that stops at 2.3. Give the processor the matching reader.
+    ksp(libs.kotlin.metadata.jvm)
     implementation(libs.hilt.navigation.compose)
 
     // Networking
@@ -521,6 +524,11 @@ dependencies {
     implementation(libs.okhttp.logging)
     implementation(libs.moshi)
     ksp(libs.moshi.codegen)
+    // kotlin-reflect reaches the app through Moshi, Jackson and Postgrest at 2.2, and with it on the classpath every
+    // typeOf() goes through it. Before 2.4.20 each call loads compiler descriptors for the class, which Ktor pays for
+    // its attribute keys while the Supabase client is built in Application.onCreate. 2.4.20 builds the type without
+    // them. The app's own classes are still compiled by Kotlin 2.3, which reads 2.4 metadata.
+    implementation(libs.kotlin.reflect)
 
     // Coroutines
     implementation(libs.coroutines.core)
